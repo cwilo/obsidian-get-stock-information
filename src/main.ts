@@ -1,5 +1,5 @@
 import { Editor, Plugin, Notice } from "obsidian";
-import { InsertLinkModal } from "./modal";
+import { InsertLinkModal, SingleValueModal } from "./modal";
 import yahooStockAPI from "yahoo-stock-api";
 import { getSymbolResponse } from "yahoo-stock-api/dist/types/getSymbol";
 
@@ -157,6 +157,103 @@ export default class StockInfoPlugin extends Plugin {
 				};
 
 				new InsertLinkModal(this.app, selectedText, onSubmit).open();
+			},
+		});
+
+		// Add command to get a single stock value
+		this.addCommand({
+			id: "get-single-stock-value",
+			name: "Get single stock value",
+			editorCallback: (editor: Editor) => {
+				const selectedText = editor.getSelection();
+
+				const onSubmit = async (ticker: string, field: string) => {
+					// helper function: format a long number into millions or billions
+					const formatLongNumber = (n: number) => {
+						if (n < 1e9) return +(n / 1e6).toFixed(3) + "M";
+						if (n >= 1e9 && n < 1e12)
+							return +(n / 1e9).toFixed(3) + "B";
+						if (n >= 1e12) return +(n / 1e12).toFixed(1) + "T";
+					};
+
+					// helper function: log error
+					const logError = (msg: string) => {
+						console.error("Error occurred:", msg);
+						new Notice(
+							"Error: couldn't retrieve stock information",
+							15000
+						);
+					};
+
+					// function to call current stock prices
+					async function callCurrentPrices(ticker: string) {
+						try {
+							return yahoo.getSymbol({
+								symbol: ticker,
+							});
+						} catch (e) {
+							console.error("An error occurred:", e);
+							new Notice(
+								"Error: couldn't retrieve stock information",
+								15000
+							);
+						}
+					}
+
+					const callCurrentPricesResponse = await callCurrentPrices(
+						ticker
+					);
+
+					if (callCurrentPricesResponse) {
+						if (!callCurrentPricesResponse.error) {
+							const currentStockInfo: getSymbolResponse =
+								callCurrentPricesResponse.response as getSymbolResponse;
+
+							// Build a map of field names to values
+							const stockData: { [key: string]: number | string | null } = {
+								name: callCurrentPricesResponse.name ?? null,
+								currency: callCurrentPricesResponse.currency ?? null,
+								bid: currentStockInfo.bid.value ?? null,
+								ask: currentStockInfo.ask.value ?? null,
+								marketCap: currentStockInfo.marketCap ?? null,
+								previousClose: currentStockInfo.previousClose ?? null,
+								volume: currentStockInfo.volume ?? null,
+								fiftytwo_high: currentStockInfo.fiftyTwoWeekRange.high ?? null,
+								fiftytwo_low: currentStockInfo.fiftyTwoWeekRange.low ?? null,
+								dayRange_high: currentStockInfo.dayRange.high ?? null,
+								dayRange_low: currentStockInfo.dayRange.low ?? null,
+							};
+
+							const value = stockData[field];
+
+							if (value !== null && value !== undefined) {
+								let output: string;
+								// Format market cap and volume nicely
+								if (field === "marketCap" && typeof value === "number") {
+									output = formatLongNumber(value) ?? String(value);
+								} else if (field === "volume" && typeof value === "number") {
+									output = value.toLocaleString("en-US");
+								} else {
+									output = String(value);
+								}
+								editor.replaceSelection(output);
+							} else {
+								new Notice(
+									`No data available for ${field}`,
+									5000
+								);
+							}
+						} else {
+							logError(
+								callCurrentPricesResponse.message as string
+							);
+						}
+					} else {
+						logError("API did not respond");
+					}
+				};
+
+				new SingleValueModal(this.app, selectedText, onSubmit).open();
 			},
 		});
 	}
