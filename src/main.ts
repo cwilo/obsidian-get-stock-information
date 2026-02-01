@@ -40,28 +40,128 @@ const formatLongNumber = (n: number) => {
 	if (n >= 1e12) return +(n / 1e12).toFixed(1) + "T";
 };
 
+const YAHOO_HEADERS = {
+	"User-Agent":
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	Accept: "application/json,text/plain,*/*",
+	Referer: "https://finance.yahoo.com/",
+};
+
+const parseStooqCsvLine = (line: string) =>
+	line
+		.split(",")
+		.map((cell) => cell.trim())
+		.map((cell) => (cell === "N/A" ? "" : cell));
+
+async function fetchStooqQuote(symbol: string): Promise<Quote | null> {
+	const normalized = normalizeSymbol(symbol);
+	const candidates = [
+		normalized.toLowerCase(),
+		`${normalized.toLowerCase()}.us`,
+	];
+
+	for (const candidate of candidates) {
+		try {
+			const url = `https://stooq.com/q/l/?s=${encodeURIComponent(
+				candidate
+			)}&f=sd2t2ohlcv&h&e=csv`;
+			const response = await requestUrl({ url });
+			const text = response.text;
+			const lines = text.trim().split(/\r?\n/);
+			if (lines.length < 2) continue;
+
+			const header = parseStooqCsvLine(lines[0]);
+			const values = parseStooqCsvLine(lines[1]);
+			const record: Record<string, string> = {};
+			header.forEach((key, index) => {
+				record[key] = values[index] ?? "";
+			});
+
+			if (!record.symbol || !record.close) continue;
+
+			const close = parseNumber(record.close);
+			const low = parseNumber(record.low);
+			const high = parseNumber(record.high);
+			const volume = parseNumber(record.volume);
+			const datePart = record.date;
+			const timePart = record.time;
+			let updated: number | undefined;
+			if (datePart) {
+				const iso = timePart
+					? `${datePart}T${timePart}Z`
+					: `${datePart}T00:00:00Z`;
+				const parsed = Date.parse(iso);
+				if (!Number.isNaN(parsed)) updated = Math.floor(parsed / 1000);
+			}
+
+			return {
+				symbol: normalized,
+				regularMarketPrice: close ?? undefined,
+				regularMarketDayLow: low ?? undefined,
+				regularMarketDayHigh: high ?? undefined,
+				regularMarketVolume: volume ?? undefined,
+				regularMarketTime: updated,
+			};
+		} catch {
+			// Try the next candidate.
+		}
+	}
+
+	return null;
+}
+
+async function fetchQuotesFromStooq(
+	symbols: string[]
+): Promise<Map<string, Quote>> {
+	const quoteMap = new Map<string, Quote>();
+	for (const symbol of symbols) {
+		const quote = await fetchStooqQuote(symbol);
+		if (quote) quoteMap.set(normalizeSymbol(symbol), quote);
+	}
+	return quoteMap;
+}
+
 async function fetchQuotes(symbols: string[]): Promise<Map<string, Quote>> {
 	const cleanedSymbols = symbols.map(normalizeSymbol).filter(Boolean);
 	if (!cleanedSymbols.length) return new Map();
 
-	const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(
-		cleanedSymbols.join(",")
-	)}`;
-	const response = await requestUrl({ url });
-	const data = response.json as {
-		quoteResponse?: { result?: Quote[] };
-	};
+	const query = encodeURIComponent(cleanedSymbols.join(","));
+	const urls = [
+		`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${query}`,
+		`https://query2.finance.yahoo.com/v7/finance/quote?symbols=${query}`,
+	];
 
-	if (!data?.quoteResponse?.result) {
-		throw new Error("Unexpected response from Yahoo Finance");
+	let lastError: unknown = null;
+	for (const url of urls) {
+		try {
+			const response = await requestUrl({
+				url,
+				headers: YAHOO_HEADERS,
+			});
+			const data = response.json as {
+				quoteResponse?: { result?: Quote[] };
+			};
+
+			if (!data?.quoteResponse?.result) {
+				throw new Error("Unexpected response from Yahoo Finance");
+			}
+
+			const quoteMap = new Map<string, Quote>();
+			for (const quote of data.quoteResponse.result) {
+				if (quote?.symbol) quoteMap.set(quote.symbol.toUpperCase(), quote);
+			}
+
+			return quoteMap;
+		} catch (e) {
+			lastError = e;
+		}
 	}
 
-	const quoteMap = new Map<string, Quote>();
-	for (const quote of data.quoteResponse.result) {
-		if (quote?.symbol) quoteMap.set(quote.symbol.toUpperCase(), quote);
-	}
+	const stooqQuotes = await fetchQuotesFromStooq(cleanedSymbols);
+	if (stooqQuotes.size > 0) return stooqQuotes;
 
-	return quoteMap;
+	if (lastError instanceof Error) throw lastError;
+	throw new Error("Failed to fetch quotes");
 }
 export default class StockInfoPlugin extends Plugin {
 	async onload() {
