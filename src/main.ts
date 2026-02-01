@@ -1,4 +1,13 @@
-import { Editor, Plugin, Notice, requestUrl, MarkdownView } from "obsidian";
+import {
+	App,
+	Editor,
+	Plugin,
+	Notice,
+	requestUrl,
+	MarkdownView,
+	PluginSettingTab,
+	Setting,
+} from "obsidian";
 import { InsertLinkModal, SingleValueModal } from "./modal";
 
 type Quote = {
@@ -40,131 +49,97 @@ const formatLongNumber = (n: number) => {
 	if (n >= 1e12) return +(n / 1e12).toFixed(1) + "T";
 };
 
-const YAHOO_HEADERS = {
-	"User-Agent":
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-	Accept: "application/json,text/plain,*/*",
-	Referer: "https://finance.yahoo.com/",
+type FinnhubQuoteResponse = {
+	c: number; // current price
+	h: number; // high price of the day
+	l: number; // low price of the day
+	o: number; // open price of the day
+	pc: number; // previous close price
+	t: number; // timestamp
 };
 
-const parseStooqCsvLine = (line: string) =>
-	line
-		.split(",")
-		.map((cell) => cell.trim())
-		.map((cell) => (cell === "N/A" ? "" : cell));
+type StockInfoSettings = {
+	finnhubApiKey: string;
+};
 
-async function fetchStooqQuote(symbol: string): Promise<Quote | null> {
+const DEFAULT_SETTINGS: StockInfoSettings = {
+	finnhubApiKey: "",
+};
+
+async function fetchFinnhubQuote(
+	symbol: string,
+	apiKey: string
+): Promise<Quote | null> {
 	const normalized = normalizeSymbol(symbol);
-	const candidates = [
-		normalized.toLowerCase(),
-		`${normalized.toLowerCase()}.us`,
-	];
-
-	for (const candidate of candidates) {
-		try {
-			const url = `https://stooq.com/q/l/?s=${encodeURIComponent(
-				candidate
-			)}&f=sd2t2ohlcv&h&e=csv`;
-			const response = await requestUrl({ url });
-			const text = response.text;
-			const lines = text.trim().split(/\r?\n/);
-			if (lines.length < 2) continue;
-
-			const header = parseStooqCsvLine(lines[0]);
-			const values = parseStooqCsvLine(lines[1]);
-			const record: Record<string, string> = {};
-			header.forEach((key, index) => {
-				record[key] = values[index] ?? "";
-			});
-
-			if (!record.symbol || !record.close) continue;
-
-			const close = parseNumber(record.close);
-			const low = parseNumber(record.low);
-			const high = parseNumber(record.high);
-			const volume = parseNumber(record.volume);
-			const datePart = record.date;
-			const timePart = record.time;
-			let updated: number | undefined;
-			if (datePart) {
-				const iso = timePart
-					? `${datePart}T${timePart}Z`
-					: `${datePart}T00:00:00Z`;
-				const parsed = Date.parse(iso);
-				if (!Number.isNaN(parsed)) updated = Math.floor(parsed / 1000);
-			}
-
-			return {
-				symbol: normalized,
-				regularMarketPrice: close ?? undefined,
-				regularMarketDayLow: low ?? undefined,
-				regularMarketDayHigh: high ?? undefined,
-				regularMarketVolume: volume ?? undefined,
-				regularMarketTime: updated,
-			};
-		} catch {
-			// Try the next candidate.
-		}
+	const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
+		normalized
+	)}&token=${encodeURIComponent(apiKey)}`;
+	const response = await requestUrl({ url, throw: false });
+	if (response.status !== 200) {
+		return null;
 	}
-
-	return null;
+	const data = response.json as FinnhubQuoteResponse;
+	if (!data || typeof data.c !== "number") {
+		return null;
+	}
+	return {
+		symbol: normalized,
+		regularMarketPrice: data.c,
+		regularMarketDayLow: data.l,
+		regularMarketDayHigh: data.h,
+		regularMarketPreviousClose: data.pc,
+		regularMarketTime: data.t,
+	};
 }
 
-async function fetchQuotesFromStooq(
-	symbols: string[]
+async function fetchQuotes(
+	symbols: string[],
+	apiKey: string
 ): Promise<Map<string, Quote>> {
-	const quoteMap = new Map<string, Quote>();
-	for (const symbol of symbols) {
-		const quote = await fetchStooqQuote(symbol);
-		if (quote) quoteMap.set(normalizeSymbol(symbol), quote);
-	}
-	return quoteMap;
-}
-
-async function fetchQuotes(symbols: string[]): Promise<Map<string, Quote>> {
 	const cleanedSymbols = symbols.map(normalizeSymbol).filter(Boolean);
 	if (!cleanedSymbols.length) return new Map();
 
-	const query = encodeURIComponent(cleanedSymbols.join(","));
-	const urls = [
-		`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${query}`,
-		`https://query2.finance.yahoo.com/v7/finance/quote?symbols=${query}`,
-	];
+	const quoteMap = new Map<string, Quote>();
+	for (const symbol of cleanedSymbols) {
+		const quote = await fetchFinnhubQuote(symbol, apiKey);
+		if (quote) quoteMap.set(symbol, quote);
+	}
+	return quoteMap;
+}
+class StockInfoSettingTab extends PluginSettingTab {
+	plugin: StockInfoPlugin;
 
-	let lastError: unknown = null;
-	for (const url of urls) {
-		try {
-			const response = await requestUrl({
-				url,
-				headers: YAHOO_HEADERS,
-			});
-			const data = response.json as {
-				quoteResponse?: { result?: Quote[] };
-			};
-
-			if (!data?.quoteResponse?.result) {
-				throw new Error("Unexpected response from Yahoo Finance");
-			}
-
-			const quoteMap = new Map<string, Quote>();
-			for (const quote of data.quoteResponse.result) {
-				if (quote?.symbol) quoteMap.set(quote.symbol.toUpperCase(), quote);
-			}
-
-			return quoteMap;
-		} catch (e) {
-			lastError = e;
-		}
+	constructor(app: App, plugin: StockInfoPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
 	}
 
-	const stooqQuotes = await fetchQuotesFromStooq(cleanedSymbols);
-	if (stooqQuotes.size > 0) return stooqQuotes;
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
 
-	if (lastError instanceof Error) throw lastError;
-	throw new Error("Failed to fetch quotes");
+		new Setting(containerEl)
+			.setName("Finnhub API key")
+			.setDesc("Used to fetch quotes from Finnhub.")
+			.addText((text) =>
+				text
+					.setPlaceholder("Enter your Finnhub API key")
+					.setValue(this.plugin.settings.finnhubApiKey)
+					.onChange(async (value) => {
+						this.plugin.settings.finnhubApiKey = value.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+	}
 }
+
 export default class StockInfoPlugin extends Plugin {
+	settings: StockInfoSettings;
+
 	async onload() {
+		await this.loadSettings();
+		this.addSettingTab(new StockInfoSettingTab(this.app, this));
+
 		console.log("reloaded");
 
 		// Add command to Obsidian quick tasks
@@ -172,6 +147,10 @@ export default class StockInfoPlugin extends Plugin {
 		const updatePortfolioTable = async (editor: Editor | null) => {
 			if (!editor) {
 				new Notice("No active markdown editor", 5000);
+				return;
+			}
+			if (!this.settings.finnhubApiKey) {
+				new Notice("Set your Finnhub API key in plugin settings", 7000);
 				return;
 			}
 
@@ -262,17 +241,24 @@ export default class StockInfoPlugin extends Plugin {
 				return;
 			}
 
-			let quotes: Map<string, Quote>;
-			try {
-				quotes = await fetchQuotes(symbols);
-			} catch (e) {
-				console.error("Error occurred:", e);
-				new Notice(
-					"Error: couldn't retrieve stock information",
-					15000
-				);
-				return;
-			}
+				let quotes: Map<string, Quote>;
+				try {
+					quotes = await fetchQuotes(
+						symbols,
+						this.settings.finnhubApiKey
+					);
+				} catch (e) {
+					console.error("Error occurred:", e);
+					new Notice(
+						"Error: couldn't retrieve stock information",
+						15000
+					);
+					return;
+				}
+				if (quotes.size === 0) {
+					new Notice("No quotes returned for table", 7000);
+					return;
+				}
 
 			const rowValues: number[] = [];
 			const updatedRows = dataRows.map((row, rowIndex) => {
@@ -362,10 +348,20 @@ export default class StockInfoPlugin extends Plugin {
 					};
 
 					try {
-						const quotes = await fetchQuotes([ticker]);
+						if (!this.settings.finnhubApiKey) {
+							new Notice(
+								"Set your Finnhub API key in plugin settings",
+								7000
+							);
+							return;
+						}
+						const quotes = await fetchQuotes(
+							[ticker],
+							this.settings.finnhubApiKey
+						);
 						const quote = quotes.get(normalizeSymbol(ticker));
 						if (!quote) {
-							logError("Symbol not found");
+							logError("No data returned for symbol");
 							return;
 						}
 
@@ -462,10 +458,20 @@ export default class StockInfoPlugin extends Plugin {
 					};
 
 					try {
-						const quotes = await fetchQuotes([ticker]);
+						if (!this.settings.finnhubApiKey) {
+							new Notice(
+								"Set your Finnhub API key in plugin settings",
+								7000
+							);
+							return;
+						}
+						const quotes = await fetchQuotes(
+							[ticker],
+							this.settings.finnhubApiKey
+						);
 						const quote = quotes.get(normalizeSymbol(ticker));
 						if (!quote) {
-							logError("Symbol not found");
+							logError("No data returned for symbol");
 							return;
 						}
 
@@ -518,5 +524,17 @@ export default class StockInfoPlugin extends Plugin {
 			const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 			await updatePortfolioTable(view?.editor ?? null);
 		});
+	}
+
+	async loadSettings() {
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			await this.loadData()
+		);
+	}
+
+	async saveSettings() {
+		await this.saveData(this.settings);
 	}
 }

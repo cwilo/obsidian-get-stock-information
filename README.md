@@ -1,7 +1,15 @@
 # Get Stock Information
-Return information about a particular stock symbol using the Yahoo Finance API.
+Return information about a particular stock symbol using the Finnhub API.
 
 ## How to use
+
+### Setup
+
+1. Install the plugin.
+2. Go to **Settings → Community Plugins → Get Stock Information**.
+3. Paste your Finnhub API key.
+
+### Commands
 
 1. In Edit mode, run the command "Get Stock Information: Insert stock info".
 2. Enter the stock symbol (e.g. AAPL)
@@ -33,6 +41,17 @@ For example"
 ><small>*Sun Apr 02 2023 18:28:05 GMT+0100 (British Summer Time)*</small>
 ```
 
+### Update portfolio table
+
+Use the command **Get Stock Information: Update portfolio table** or click the ribbon refresh icon.
+
+Requirements:
+- A markdown table with a **Fund/Ticker/Symbol** column and a **Shares** column.
+- Optional columns: **Current Price**, **Allocation**, **Value**.
+
+Notes:
+- Finnhub’s quote endpoint does not include bid/ask, market cap, or 52‑week range. Those fields will be blank.
+
 ## Credit
 
-https://github.com/phamleduy04/yahoo-stock-api - the project I've used to pull in the information from Yahoo Finance
+https://finnhub.io/ - market data provider
