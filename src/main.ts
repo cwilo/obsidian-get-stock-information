@@ -171,162 +171,235 @@ export default class StockInfoPlugin extends Plugin {
 				return trimmed.split("|").map((cell) => cell.trim());
 			};
 
-			let tableStart = -1;
-			let tableEnd = -1;
-			let header: string[] = [];
+			type TableInfo = {
+				start: number;
+				end: number;
+				header: string[];
+				rows: string[][];
+				tickerIndex: number;
+				sharesIndex: number;
+				priceIndex: number;
+				valueIndex: number;
+				allocationIndex: number;
+				symbols: string[];
+			};
 
-			for (let i = 0; i < lines.length - 1; i++) {
-				if (isTableRow(lines[i]) && isTableSeparator(lines[i + 1])) {
-					tableStart = i;
-					header = splitRow(lines[i]);
-					let j = i + 2;
-					while (j < lines.length && isTableRow(lines[j])) j++;
-					tableEnd = j - 1;
-					break;
-				}
-			}
-
-			if (tableStart === -1 || tableEnd === -1) {
-				new Notice("No markdown table found", 5000);
-				return;
-			}
-
-			const headerIndex = (names: string[]) =>
+			const tables: TableInfo[] = [];
+			const headerIndexFor = (header: string[], names: string[]) =>
 				header.findIndex((h) =>
 					names.includes(h.trim().toLowerCase())
 				);
 
-			const tickerIndex = headerIndex([
-				"fund",
-				"ticker",
-				"symbol",
-				"fund/ticker",
-			]);
-			const sharesIndex = headerIndex([
-				"shares",
-				"qty",
-				"quantity",
-				"units",
-			]);
-			const priceIndex = headerIndex([
-				"current price",
-				"price",
-				"last price",
-			]);
-			const valueIndex = headerIndex(["value", "market value"]);
-			const allocationIndex = headerIndex([
-				"allocation",
-				"allocation %",
-				"alloc %",
-			]);
+			for (let i = 0; i < lines.length - 1; i++) {
+				if (!isTableRow(lines[i]) || !isTableSeparator(lines[i + 1])) {
+					continue;
+				}
 
-			if (tickerIndex === -1 || sharesIndex === -1) {
+				const header = splitRow(lines[i]);
+				let j = i + 2;
+				while (j < lines.length && isTableRow(lines[j])) j++;
+
+				const rows = lines.slice(i + 2, j).map(splitRow);
+
+				const tickerIndex = headerIndexFor(header, [
+					"fund",
+					"ticker",
+					"symbol",
+					"fund/ticker",
+				]);
+				const sharesIndex = headerIndexFor(header, [
+					"shares",
+					"qty",
+					"quantity",
+					"units",
+				]);
+				const priceIndex = headerIndexFor(header, [
+					"current price",
+					"price",
+					"last price",
+				]);
+				const valueIndex = headerIndexFor(header, [
+					"value",
+					"market value",
+				]);
+				const allocationIndex = headerIndexFor(header, [
+					"allocation",
+					"allocation %",
+					"alloc %",
+				]);
+
+				const symbols = rows
+					.map((row) => row[tickerIndex])
+					.filter(Boolean)
+					.map(normalizeSymbol);
+
+				tables.push({
+					start: i,
+					end: j - 1,
+					header,
+					rows,
+					tickerIndex,
+					sharesIndex,
+					priceIndex,
+					valueIndex,
+					allocationIndex,
+					symbols,
+				});
+
+				i = j - 1;
+			}
+
+			if (tables.length === 0) {
+				new Notice("No markdown table found", 5000);
+				return;
+			}
+
+			const allSymbols = Array.from(
+				new Set(
+					tables
+						.filter(
+							(t) => t.tickerIndex !== -1 && t.sharesIndex !== -1
+						)
+						.flatMap((t) => t.symbols)
+				)
+			);
+
+			if (!allSymbols.length) {
+				new Notice("No tickers found in tables", 5000);
+				return;
+			}
+
+			let quotes: Map<string, Quote>;
+			try {
+				quotes = await fetchQuotes(
+					allSymbols,
+					this.settings.finnhubApiKey
+				);
+			} catch (e) {
+				console.error("Error occurred:", e);
 				new Notice(
-					"Table must include a Ticker/Fund column and a Shares column",
-					7000
+					"Error: couldn't retrieve stock information",
+					15000
 				);
 				return;
 			}
-
-			const dataRows = lines
-				.slice(tableStart + 2, tableEnd + 1)
-				.map(splitRow);
-			const symbols = dataRows
-				.map((row) => row[tickerIndex])
-				.filter(Boolean)
-				.map(normalizeSymbol);
-
-			if (!symbols.length) {
-				new Notice("No tickers found in the table", 5000);
+			if (quotes.size === 0) {
+				new Notice("No quotes returned for tables", 7000);
 				return;
 			}
 
-				let quotes: Map<string, Quote>;
-				try {
-					quotes = await fetchQuotes(
-						symbols,
-						this.settings.finnhubApiKey
+			const updatedLines: string[] = [];
+			const missingColumnsMessages: string[] = [];
+			const skippedTables: string[] = [];
+			let tablesUpdated = 0;
+
+			let i = 0;
+			while (i < lines.length) {
+				const table = tables.find((t) => t.start === i);
+				if (!table) {
+					updatedLines.push(lines[i]);
+					i += 1;
+					continue;
+				}
+
+				const {
+					header,
+					rows,
+					tickerIndex,
+					sharesIndex,
+					priceIndex,
+					valueIndex,
+					allocationIndex,
+					start,
+				} = table;
+
+				if (tickerIndex === -1 || sharesIndex === -1) {
+					skippedTables.push(
+						`line ${start + 1} (missing Ticker/Fund or Shares column)`
 					);
-				} catch (e) {
-					console.error("Error occurred:", e);
-					new Notice(
-						"Error: couldn't retrieve stock information",
-						15000
-					);
-					return;
-				}
-				if (quotes.size === 0) {
-					new Notice("No quotes returned for table", 7000);
-					return;
+					updatedLines.push(...lines.slice(start, table.end + 1));
+					i = table.end + 1;
+					continue;
 				}
 
-			const rowValues: number[] = [];
-			const updatedRows = dataRows.map((row, rowIndex) => {
-				while (row.length < header.length) row.push("");
-				const symbol = normalizeSymbol(row[tickerIndex] || "");
-				const quote = quotes.get(symbol);
-				if (!quote) return row;
+				const rowValues: number[] = [];
+				const updatedRows = rows.map((row, rowIndex) => {
+					while (row.length < header.length) row.push("");
+					const symbol = normalizeSymbol(row[tickerIndex] || "");
+					const quote = quotes.get(symbol);
+					if (!quote) return row;
 
-				const price =
-					quote.regularMarketPrice ??
-					quote.ask ??
-					quote.bid ??
-					quote.regularMarketPreviousClose ??
-					null;
-				const shares = parseNumber(row[sharesIndex]);
-				const value =
-					price !== null && shares !== null ? price * shares : null;
+					const price =
+						quote.regularMarketPrice ??
+						quote.ask ??
+						quote.bid ??
+						quote.regularMarketPreviousClose ??
+						null;
+					const shares = parseNumber(row[sharesIndex]);
+					const value =
+						price !== null && shares !== null
+							? price * shares
+							: null;
 
-				if (priceIndex !== -1 && price !== null) {
-					row[priceIndex] = formatNumber(price, 2);
-				}
-				if (valueIndex !== -1 && value !== null) {
-					row[valueIndex] = formatNumber(value, 2);
-				}
-				rowValues[rowIndex] = value ?? 0;
-				return row;
-			});
-
-			const totalValue = rowValues.reduce((sum, v) => sum + v, 0);
-			if (allocationIndex !== -1 && totalValue > 0) {
-				updatedRows.forEach((row, rowIndex) => {
-					const value = rowValues[rowIndex] ?? 0;
-					const allocation = (value / totalValue) * 100;
-					row[allocationIndex] = formatNumber(allocation, 2);
+					if (priceIndex !== -1 && price !== null) {
+						row[priceIndex] = formatNumber(price, 2);
+					}
+					if (valueIndex !== -1 && value !== null) {
+						row[valueIndex] = formatNumber(value, 2);
+					}
+					rowValues[rowIndex] = value ?? 0;
+					return row;
 				});
+
+				const totalValue = rowValues.reduce((sum, v) => sum + v, 0);
+				if (allocationIndex !== -1 && totalValue > 0) {
+					updatedRows.forEach((row, rowIndex) => {
+						const value = rowValues[rowIndex] ?? 0;
+						const allocation = (value / totalValue) * 100;
+						row[allocationIndex] = formatNumber(allocation, 2);
+					});
+				}
+
+				const updatedTableLines = [
+					`| ${header.join(" | ")} |`,
+					lines[start + 1],
+					...updatedRows.map((row) => `| ${row.join(" | ")} |`),
+				];
+
+				updatedLines.push(...updatedTableLines);
+				i = table.end + 1;
+				tablesUpdated += 1;
+
+				const missingColumns: string[] = [];
+				if (priceIndex === -1) missingColumns.push("Current Price");
+				if (allocationIndex === -1) missingColumns.push("Allocation");
+				if (missingColumns.length) {
+					missingColumnsMessages.push(
+						`line ${start + 1}: ${missingColumns.join(", ")}`
+					);
+				}
 			}
 
-			const updatedTableLines = [
-				`| ${header.join(" | ")} |`,
-				lines[tableStart + 1],
-				...updatedRows.map((row) => `| ${row.join(" | ")} |`),
-			];
-
-			const before = lines.slice(0, tableStart);
-			const after = lines.slice(tableEnd + 1);
-			const updatedText = [...before, ...updatedTableLines, ...after].join(
-				"\n"
-			);
-
+			const updatedText = updatedLines.join("\n");
 			if (selection) {
 				editor.replaceSelection(updatedText);
 			} else {
 				editor.setValue(updatedText);
 			}
 
-			const missingColumns: string[] = [];
-			if (priceIndex === -1) missingColumns.push("Current Price");
-			if (allocationIndex === -1) missingColumns.push("Allocation");
-			if (missingColumns.length) {
-				new Notice(
-					`Updated table. Add column(s): ${missingColumns.join(
-						", "
-					)} to populate them.`,
-					8000
+			const notices: string[] = [];
+			notices.push(`Updated ${tablesUpdated} table(s)`);
+			if (missingColumnsMessages.length) {
+				notices.push(
+					`Add column(s) to populate: ${missingColumnsMessages.join(
+						"; "
+					)}`
 				);
-			} else {
-				new Notice("Updated portfolio table", 3000);
 			}
+			if (skippedTables.length) {
+				notices.push(`Skipped table(s): ${skippedTables.join("; ")}`);
+			}
+			new Notice(notices.join(". ") + ".", 8000);
 		};
 
 		this.addCommand({
