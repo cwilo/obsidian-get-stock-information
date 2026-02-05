@@ -58,6 +58,11 @@ type FinnhubQuoteResponse = {
 	t: number; // timestamp
 };
 
+type FinnhubQuoteResult = {
+	quote: Quote | null;
+	status: number;
+};
+
 type StockInfoSettings = {
 	finnhubApiKey: string;
 };
@@ -66,29 +71,33 @@ const DEFAULT_SETTINGS: StockInfoSettings = {
 	finnhubApiKey: "",
 };
 
+const sleep = (ms: number) =>
+	new Promise((resolve) => setTimeout(resolve, ms));
+
 async function fetchFinnhubQuote(
 	symbol: string,
 	apiKey: string
-): Promise<Quote | null> {
+): Promise<FinnhubQuoteResult> {
 	const normalized = normalizeSymbol(symbol);
 	const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(
 		normalized
 	)}&token=${encodeURIComponent(apiKey)}`;
 	const response = await requestUrl({ url, throw: false });
-	if (response.status !== 200) {
-		return null;
-	}
+	if (response.status !== 200) return { quote: null, status: response.status };
 	const data = response.json as FinnhubQuoteResponse;
 	if (!data || typeof data.c !== "number") {
-		return null;
+		return { quote: null, status: response.status };
 	}
 	return {
-		symbol: normalized,
-		regularMarketPrice: data.c,
-		regularMarketDayLow: data.l,
-		regularMarketDayHigh: data.h,
-		regularMarketPreviousClose: data.pc,
-		regularMarketTime: data.t,
+		quote: {
+			symbol: normalized,
+			regularMarketPrice: data.c,
+			regularMarketDayLow: data.l,
+			regularMarketDayHigh: data.h,
+			regularMarketPreviousClose: data.pc,
+			regularMarketTime: data.t,
+		},
+		status: response.status,
 	};
 }
 
@@ -100,9 +109,23 @@ async function fetchQuotes(
 	if (!cleanedSymbols.length) return new Map();
 
 	const quoteMap = new Map<string, Quote>();
+	let lastRequestTime = 0;
 	for (const symbol of cleanedSymbols) {
-		const quote = await fetchFinnhubQuote(symbol, apiKey);
-		if (quote) quoteMap.set(symbol, quote);
+		const now = Date.now();
+		const sinceLast = now - lastRequestTime;
+		// Finnhub free tier: 60 requests/minute. Throttle to ~2 req/sec.
+		if (sinceLast < 550) await sleep(550 - sinceLast);
+		lastRequestTime = Date.now();
+
+		const result = await fetchFinnhubQuote(symbol, apiKey);
+		if (result.status === 429) {
+			// Back off and retry once after 2 seconds.
+			await sleep(2000);
+			const retry = await fetchFinnhubQuote(symbol, apiKey);
+			if (retry.quote) quoteMap.set(symbol, retry.quote);
+			continue;
+		}
+		if (result.quote) quoteMap.set(symbol, result.quote);
 	}
 	return quoteMap;
 }
@@ -288,6 +311,10 @@ export default class StockInfoPlugin extends Plugin {
 				return;
 			}
 
+			const missingSymbols = allSymbols.filter(
+				(symbol) => !quotes.has(symbol)
+			);
+
 			const updatedLines: string[] = [];
 			const missingColumnsMessages: string[] = [];
 			const skippedTables: string[] = [];
@@ -389,6 +416,11 @@ export default class StockInfoPlugin extends Plugin {
 
 			const notices: string[] = [];
 			notices.push(`Updated ${tablesUpdated} table(s)`);
+			if (missingSymbols.length) {
+				notices.push(
+					`Missing quotes: ${missingSymbols.join(", ")}`
+				);
+			}
 			if (missingColumnsMessages.length) {
 				notices.push(
 					`Add column(s) to populate: ${missingColumnsMessages.join(
